@@ -2,10 +2,531 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>Hello World</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- 보안 정책 완화 (FFmpeg SharedArrayBuffer 문제 회피용 헤더는 로컬 실행 시 적용 불가하므로 싱글스레드/구버전 사용) -->
+    <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <title>WebCut V6 - Ultimate Loader</title>
+    <style>
+        :root { --bg: #0f0f0f; --panel: #181818; --accent: #3b82f6; }
+        body { background: var(--bg); color: #ddd; font-family: sans-serif; overflow: hidden; user-select: none; }
+        
+        /* 스크롤바 & UI */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
+        .panel { background: var(--panel); border: 1px solid #333; }
+        .btn { transition: 0.2s; } .btn:active { transform: scale(0.95); }
+
+        /* 타임라인 클립 */
+        .clip { position: absolute; height: 100%; border-radius: 4px; overflow: hidden; cursor: pointer; display: flex; align-items: center; padding: 0 8px; font-size: 11px; box-sizing: border-box; border: 2px solid transparent; }
+        .clip.video { background: #1e40af; border-color: #1e3a8a; }
+        .clip.text { background: #6d28d9; border-color: #5b21b6; z-index: 10; }
+        .clip.selected { border-color: #fbbf24; z-index: 20; box-shadow: 0 0 0 2px rgba(251,191,36,0.3); }
+        
+        /* 핸들 & 재생 헤드 */
+        .resize-h { position: absolute; top:0; bottom:0; width:10px; cursor:ew-resize; z-index:30; }
+        .resize-h:hover { background: rgba(255,255,255,0.3); }
+        .rh-l { left:0; } .rh-r { right:0; }
+        
+        #playhead { position: absolute; top:0; bottom:0; width:1px; background: red; z-index: 50; pointer-events:none; }
+        #playhead-head { position: absolute; top:-5px; left:-5px; width:11px; height:11px; background: red; transform: rotate(45deg); pointer-events:auto; cursor: ew-resize; }
+
+        canvas { background: #000; max-width: 100%; max-height: 100%; box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
+
+        /* 로딩 오버레이 */
+        #overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 999; display: flex; justify-content: center; align-items: center; flex-direction: column; }
+        .hidden { display: none !important; }
+        .progress-bar { width: 300px; height: 6px; background: #333; border-radius: 3px; margin-top: 10px; overflow: hidden; }
+        .progress-fill { height: 100%; background: #3b82f6; width: 0%; transition: width 0.2s; }
+    </style>
 </head>
-<body>
-    <h1>안녕하세요!</h1>
-    <p>성공적으로 생성된 HTML 파일입니다.</p>
+<body class="flex flex-col h-screen">
+
+    <!-- 로딩/변환 오버레이 -->
+    <div id="overlay" class="hidden">
+        <h2 id="overlayTitle" class="text-xl font-bold mb-2">처리 중...</h2>
+        <p id="overlayDesc" class="text-sm text-gray-400 mb-4">비디오를 읽고 있습니다.</p>
+        <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+        <button id="cancelBtn" class="mt-6 text-xs text-gray-500 hover:text-white underline">취소</button>
+    </div>
+
+    <!-- 1. 헤더 -->
+    <header class="h-12 border-b border-[#333] bg-[#0a0a0a] flex items-center justify-between px-4 shrink-0">
+        <div class="flex items-center gap-2 font-bold">
+            <span class="w-2 h-6 bg-blue-600 rounded"></span> WebCut V6 <span class="text-[10px] text-gray-500 font-normal">FFmpeg Engine</span>
+        </div>
+        <div class="flex gap-2">
+            <button id="exportBtn" class="bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold px-4 py-1.5 rounded btn">내보내기</button>
+        </div>
+    </header>
+
+    <!-- 2. 워크스페이스 -->
+    <div class="flex-1 flex overflow-hidden">
+        <!-- 좌측: 파일 -->
+        <aside class="w-64 panel border-r-0 border-t-0 z-10 flex flex-col">
+            <div class="p-2 border-b border-[#333] text-[10px] text-gray-500 font-bold">MEDIA</div>
+            <div id="assetList" class="flex-1 overflow-y-auto p-2 space-y-2">
+                <div class="border border-dashed border-[#444] rounded p-4 text-center hover:bg-[#222] transition cursor-pointer relative">
+                    <input type="file" id="fileInput" class="absolute inset-0 opacity-0 cursor-pointer" multiple>
+                    <div class="text-2xl text-gray-500">+</div>
+                    <div class="text-[10px] text-gray-400">파일 추가 (MP4/MOV/AVI)</div>
+                </div>
+            </div>
+            <div class="p-2 border-t border-[#333]">
+                <button id="addTextBtn" class="w-full bg-[#2a2a2a] hover:bg-[#333] text-purple-300 py-2 rounded text-xs font-bold btn">T 자막 추가</button>
+            </div>
+        </aside>
+
+        <!-- 중앙: 캔버스 -->
+        <main class="flex-1 bg-[#050505] flex flex-col relative overflow-hidden">
+            <div class="flex-1 flex items-center justify-center p-6" id="canvasContainer">
+                <canvas id="cvs"></canvas>
+                <!-- muted, playsinline, preload=auto: 로딩 성공률 향상 -->
+                <video id="vidSource" class="hidden" muted playsinline preload="auto"></video>
+            </div>
+            <div class="h-12 bg-[#111] border-t border-[#333] flex items-center justify-center gap-6 shrink-0">
+                <span id="currTime" class="font-mono text-xs text-gray-500 w-12 text-right">0:00</span>
+                <button id="playBtn" class="text-xl text-white w-8 h-8 flex items-center justify-center rounded-full hover:bg-[#333]">▶</button>
+                <span id="totalTime" class="font-mono text-xs text-gray-500 w-12">0:00</span>
+            </div>
+        </main>
+
+        <!-- 우측: 속성 -->
+        <aside class="w-64 panel border-l-0 border-t-0 z-10">
+            <div class="p-2 border-b border-[#333] text-[10px] text-gray-500 font-bold">PROPERTIES</div>
+            <div id="props" class="p-4 text-xs text-center text-gray-600 mt-10">선택 없음</div>
+        </aside>
+    </div>
+
+    <!-- 3. 타임라인 -->
+    <div class="h-72 panel border-t border-[#333] bg-[#111] shrink-0 flex flex-col">
+        <div class="h-9 bg-[#1a1a1a] border-b border-[#333] flex items-center justify-between px-2 shrink-0">
+            <div class="flex gap-2">
+                <button id="splitBtn" class="px-2 py-1 bg-[#333] hover:bg-[#444] rounded text-[10px] text-gray-300 btn">✂️ 자르기</button>
+                <button id="delBtn" class="px-2 py-1 bg-red-900/30 hover:bg-red-900/50 text-red-400 rounded text-[10px] btn">🗑 삭제</button>
+            </div>
+            <input type="range" id="zoom" min="10" max="200" value="50" class="w-24 accent-blue-500">
+        </div>
+
+        <div class="flex-1 flex overflow-hidden relative">
+            <!-- 트랙 헤더 -->
+            <div class="w-16 bg-[#1a1a1a] border-r border-[#333] shrink-0 z-20 flex flex-col text-[9px] text-gray-500 font-bold text-center">
+                <div class="h-6 border-b border-[#333] bg-[#222]"></div>
+                <div class="flex-1 flex items-center justify-center border-b border-[#333]">TEXT</div>
+                <div class="h-16 flex items-center justify-center bg-[#151515] text-blue-500">VIDEO</div>
+            </div>
+
+            <!-- 스크롤 영역 -->
+            <div id="tlScroll" class="flex-1 overflow-x-auto overflow-y-hidden relative bg-[#0f0f0f]">
+                <div id="tlContent" class="h-full relative min-w-full">
+                    <div id="ruler" class="h-6 bg-[#1a1a1a] border-b border-[#333] w-full relative cursor-pointer"></div>
+                    
+                    <div id="playhead">
+                        <div id="playhead-head"></div>
+                    </div>
+
+                    <div class="flex flex-col h-[calc(100%-24px)]">
+                        <div id="trackText" class="flex-1 relative border-b border-[#222]"></div>
+                        <div id="trackVideo" class="h-16 relative border-b border-[#222] bg-[#0a0a0a]"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createFFmpeg, fetchFile } = FFmpeg;
+        // 싱글 코어 버전 사용 (SharedArrayBuffer 오류 방지)
+        const ffmpeg = createFFmpeg({ log: true, corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js' });
+
+        const S = {
+            assets: [], clips: [],
+            curr: 0, dur: 0, zoom: 50,
+            playing: false, sel: null,
+            drag: null
+        };
+
+        const D = {
+            cvs: document.getElementById('cvs'),
+            ctx: document.getElementById('cvs').getContext('2d'),
+            vid: document.getElementById('vidSource'),
+            tlContent: document.getElementById('tlContent'),
+            trackV: document.getElementById('trackVideo'),
+            trackT: document.getElementById('trackText'),
+            ph: document.getElementById('playhead'),
+            overlay: document.getElementById('overlay'),
+            pBar: document.getElementById('progressFill'),
+            pTitle: document.getElementById('overlayTitle'),
+            pDesc: document.getElementById('overlayDesc')
+        };
+
+        D.cvs.width = 1280; D.cvs.height = 720;
+
+        // --- 1. 파일 로더 (하이브리드 엔진) ---
+        document.getElementById('fileInput').onchange = async (e) => {
+            for (const file of e.target.files) {
+                await loadVideoSafe(file);
+            }
+            e.target.value = '';
+        };
+
+        async function loadVideoSafe(file) {
+            showLoading(true, "비디오 분석 중...", "파일 형식을 확인하고 있습니다.");
+            
+            try {
+                // 1차 시도: 네이티브 로드
+                const url = URL.createObjectURL(file);
+                const vid = document.createElement('video');
+                vid.muted = true; vid.preload = 'auto'; vid.src = url;
+
+                await new Promise((resolve, reject) => {
+                    const timer = setTimeout(() => reject('timeout'), 5000); // 5초 타임아웃
+                    vid.onloadedmetadata = () => {
+                        if (vid.videoWidth > 0) { clearTimeout(timer); resolve(); }
+                    };
+                    vid.onerror = () => { clearTimeout(timer); reject('error'); };
+                });
+
+                // 성공 시
+                addAsset(file, url, vid.duration, vid.videoWidth, vid.videoHeight);
+                showLoading(false);
+
+            } catch (err) {
+                // 실패 시: FFmpeg 변환 제안
+                if (confirm(`⚠️ 브라우저가 이 파일(${file.name})을 바로 읽지 못합니다.\n(이유: 코덱 호환성 또는 타임아웃)\n\n[변환 엔진]을 사용하여 편집 가능한 형식으로 변경하시겠습니까?`)) {
+                    await transcodeAndLoad(file);
+                } else {
+                    showLoading(false);
+                }
+            }
+        }
+
+        async function transcodeAndLoad(file) {
+            showLoading(true, "변환 엔진 가동 중...", "FFmpeg 엔진을 로드하고 있습니다. (최초 1회 느림)");
+            
+            try {
+                if (!ffmpeg.isLoaded()) await ffmpeg.load();
+
+                showLoading(true, "비디오 변환 중...", "고속 변환(Ultrafast) 모드로 처리 중입니다. 잠시만 기다리세요.");
+                
+                const inName = 'input_' + Date.now();
+                const outName = 'output.mp4';
+
+                ffmpeg.FS('writeFile', inName, await fetchFile(file));
+
+                // 고속 변환 명령어: -preset ultrafast -c:v libx264 -crf 23 (화질 유지, 속도 우선)
+                await ffmpeg.run('-i', inName, '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', outName);
+
+                const data = ffmpeg.FS('readFile', outName);
+                const blob = new Blob([data.buffer], { type: 'video/mp4' });
+                const url = URL.createObjectURL(blob);
+
+                // 변환된 파일 정보 읽기
+                const vid = document.createElement('video');
+                vid.src = url;
+                await new Promise(r => vid.onloadedmetadata = r);
+
+                addAsset(file, url, vid.duration, vid.videoWidth, vid.videoHeight, true); // true = converted
+                
+                // Cleanup
+                ffmpeg.FS('unlink', inName);
+                ffmpeg.FS('unlink', outName);
+                showLoading(false);
+
+            } catch (e) {
+                console.error(e);
+                alert("변환 실패: " + e.message);
+                showLoading(false);
+            }
+        }
+
+        function showLoading(show, title, desc) {
+            if (show) {
+                D.overlay.classList.remove('hidden');
+                D.pTitle.innerText = title || "로딩 중";
+                D.pDesc.innerText = desc || "";
+                D.pBar.style.width = '100%'; // Fake progress for UX
+            } else {
+                D.overlay.classList.add('hidden');
+            }
+        }
+
+        function addAsset(file, url, dur, w, h, converted = false) {
+            const asset = { id: 'a_'+Date.now(), name: file.name, url, dur, w, h };
+            S.assets.push(asset);
+            
+            const div = document.createElement('div');
+            div.className = "flex justify-between items-center bg-[#222] p-2 rounded hover:bg-[#333] text-[10px] mb-1";
+            div.innerHTML = `
+                <div class="truncate w-32 text-gray-300">
+                    ${converted ? '🔄 ' : ''}${asset.name}
+                </div>
+                <button class="bg-blue-700 hover:bg-blue-600 text-white px-2 py-0.5 rounded">ADD</button>
+            `;
+            div.querySelector('button').onclick = () => addClip('video', asset);
+            document.getElementById('assetList').appendChild(div);
+        }
+
+        // --- 2. 클립 & 타임라인 ---
+        document.getElementById('addTextBtn').onclick = () => addClip('text');
+
+        function addClip(type, asset) {
+            const id = 'c_' + Date.now();
+            if (type === 'video') {
+                const clip = { id, type, aid: asset.id, srcStart: 0, dur: asset.dur, tStart: 0 };
+                S.clips.push(clip);
+            } else {
+                const clip = { id, type, dur: 5, tStart: S.curr, text: '자막', style: {x:640, y:600, s:60, c:'#ffffff'} };
+                S.clips.push(clip);
+            }
+            calcMagnetic();
+            selectClip(id);
+        }
+
+        function calcMagnetic() {
+            let cur = 0;
+            S.clips.filter(c => c.type==='video').forEach(c => {
+                c.tStart = cur; cur += c.dur;
+            });
+            const max = Math.max(cur, ...S.clips.map(c => c.tStart + c.dur), 10);
+            S.dur = max;
+            renderTL();
+            draw();
+        }
+
+        function renderTL() {
+            D.trackV.innerHTML = ''; D.trackT.innerHTML = ''; 
+            document.getElementById('ruler').innerHTML = '';
+            D.tlContent.style.width = (S.dur * S.zoom + 200) + 'px';
+
+            // Ruler
+            for(let i=0; i<=S.dur; i+=Math.floor(100/S.zoom)||1) {
+                const el = document.createElement('div');
+                el.className = "absolute bottom-0 h-2 border-l border-[#444] text-[9px] text-gray-500 pl-1 pointer-events-none";
+                el.style.left = (i*S.zoom)+'px';
+                el.innerText = Math.floor(i/60)+":"+(i%60).toString().padStart(2,'0');
+                document.getElementById('ruler').appendChild(el);
+            }
+
+            S.clips.forEach(c => {
+                const el = document.createElement('div');
+                el.className = `clip ${c.type} ${S.sel===c.id ? 'selected' : ''}`;
+                el.style.left = (c.tStart * S.zoom) + 'px';
+                el.style.width = (c.dur * S.zoom) + 'px';
+                
+                const name = c.type==='video' ? S.assets.find(a=>a.id===c.aid).name : c.text;
+                el.innerHTML = `<span class="truncate pointer-events-none">${name}</span>
+                                <div class="resize-h rh-l"></div><div class="resize-h rh-r"></div>`;
+
+                // Events
+                el.onmousedown = e => { 
+                    if(e.target.classList.contains('resize-h')) {
+                        dragStart(e, e.target.classList.contains('rh-l') ? 'resize_l' : 'resize_r', c);
+                    } else {
+                        dragStart(e, 'move', c);
+                    }
+                };
+
+                (c.type==='video' ? D.trackV : D.trackT).appendChild(el);
+            });
+            updatePH();
+        }
+
+        function updatePH() {
+            D.ph.style.transform = `translateX(${S.curr * S.zoom}px)`;
+            document.getElementById('currTime').innerText = fmt(S.curr);
+            document.getElementById('totalTime').innerText = fmt(S.dur);
+        }
+
+        // --- 3. 인터랙션 ---
+        function dragStart(e, type, tar) {
+            e.stopPropagation(); e.preventDefault();
+            S.sel = tar ? tar.id : null;
+            renderTL(); updateProps();
+            
+            S.drag = {
+                type, id: tar?.id, sx: e.clientX, st: S.curr,
+                sv: tar ? { ...tar, style:{...tar.style} } : null
+            };
+        }
+
+        window.addEventListener('mousemove', e => {
+            if(!S.drag) return;
+            const d = S.drag;
+            const dx = (e.clientX - d.sx) / S.zoom;
+            const c = S.clips.find(x=>x.id===d.id);
+
+            if (d.type === 'ph') {
+                S.curr = Math.max(0, Math.min(S.dur, d.st + dx));
+                updatePH(); draw();
+            }
+            else if (d.type === 'move' && c.type === 'text') {
+                c.tStart = Math.max(0, d.sv.tStart + dx);
+                renderTL(); draw();
+            }
+            else if (d.type === 'resize_r') {
+                let nd = Math.max(0.2, d.sv.dur + dx);
+                if (c.type==='video') {
+                    const a = S.assets.find(x=>x.id===c.aid);
+                    if (c.srcStart + nd > a.dur) nd = a.dur - c.srcStart;
+                    c.dur = nd;
+                    calcMagnetic();
+                } else {
+                    c.dur = nd;
+                    renderTL();
+                }
+            }
+            // Canvas Text Drag logic (simplified inline)
+            else if (d.type === 'cvs_txt') {
+                 // re-calc in global mousemove for canvas
+            }
+        });
+        
+        // Canvas Drag Specific
+        D.cvs.onmousedown = e => {
+            const r = D.cvs.getBoundingClientRect();
+            const x = (e.clientX - r.left)*(D.cvs.width/r.width);
+            const y = (e.clientY - r.top)*(D.cvs.height/r.height);
+            
+            const hits = S.clips.filter(c => c.type==='text' && S.curr>=c.tStart && S.curr<c.tStart+c.dur).reverse();
+            for(const t of hits) {
+                if(Math.abs(x - t.style.x)<100 && Math.abs(y - t.style.y)<50) {
+                    S.sel = t.id; renderTL(); updateProps();
+                    S.drag = { type: 'cvs_txt', id: t.id, sx: e.clientX, sy: e.clientY, ix: t.style.x, iy: t.style.y };
+                    return;
+                }
+            }
+        };
+        
+        window.addEventListener('mousemove', e => {
+            if (S.drag && S.drag.type === 'cvs_txt') {
+                const c = S.clips.find(x=>x.id===S.drag.id);
+                const r = D.cvs.getBoundingClientRect();
+                const scX = D.cvs.width/r.width;
+                const scY = D.cvs.height/r.height;
+                c.style.x = S.drag.ix + (e.clientX - S.drag.sx)*scX;
+                c.style.y = S.drag.iy + (e.clientY - S.drag.sy)*scY;
+                draw();
+            }
+        });
+
+        window.addEventListener('mouseup', () => S.drag = null);
+        
+        document.getElementById('playhead-head').onmousedown = e => dragStart(e, 'ph');
+        document.getElementById('ruler').onmousedown = e => {
+            const r = document.getElementById('ruler').getBoundingClientRect();
+            S.curr = Math.max(0, (e.clientX - r.left + document.getElementById('tlScroll').scrollLeft)/S.zoom);
+            updatePH(); draw(); dragStart(e, 'ph');
+        };
+
+        // --- 4. 드로잉 & 내보내기 ---
+        function draw() {
+            D.ctx.fillStyle = '#000'; D.ctx.fillRect(0,0,D.cvs.width,D.cvs.height);
+            
+            // Video
+            const v = S.clips.find(c => c.type==='video' && S.curr>=c.tStart && S.curr<c.tStart+c.dur);
+            if (v) {
+                const a = S.assets.find(x=>x.id===v.aid);
+                if (D.vid.src !== a.url) D.vid.src = a.url;
+                const t = (S.curr - v.tStart) + v.srcStart;
+                if (Math.abs(D.vid.currentTime - t) > 0.2) D.vid.currentTime = t;
+                D.ctx.drawImage(D.vid, 0,0, D.cvs.width, D.cvs.height);
+            }
+
+            // Text
+            S.clips.filter(c => c.type==='text' && S.curr>=c.tStart && S.curr<c.tStart+c.dur).forEach(t => {
+                D.ctx.save();
+                D.ctx.translate(t.style.x, t.style.y);
+                D.ctx.font = `bold ${t.style.s}px sans-serif`;
+                D.ctx.fillStyle = t.style.c;
+                D.ctx.strokeStyle = '#000'; D.ctx.lineWidth = 4; D.ctx.textAlign='center'; D.ctx.textBaseline='middle';
+                D.ctx.strokeText(t.text, 0,0); D.ctx.fillText(t.text, 0,0);
+                if (S.sel===t.id) {
+                    D.ctx.strokeStyle='#fbbf24'; D.ctx.lineWidth=2; D.ctx.setLineDash([5,5]);
+                    D.ctx.strokeRect(-100,-40,200,80); // Simple selection box
+                }
+                D.ctx.restore();
+            });
+        }
+
+        // 재생
+        document.getElementById('playBtn').onclick = () => {
+            S.playing = !S.playing;
+            document.getElementById('playBtn').innerText = S.playing ? "❚❚" : "▶";
+            if (S.playing) loop(); else D.vid.pause();
+        };
+
+        function loop() {
+            if (!S.playing) return;
+            S.curr += 0.033; // ~30fps
+            if (S.curr >= S.dur) { S.curr=S.dur; S.playing=false; document.getElementById('playBtn').innerText="▶"; }
+            updatePH(); draw();
+            requestAnimationFrame(loop);
+        }
+
+        // Export
+        document.getElementById('exportBtn').onclick = () => {
+            if(S.dur<=0) return alert("내보낼 내용이 없습니다.");
+            const btn = document.getElementById('exportBtn');
+            btn.innerText="렌더링..."; btn.disabled=true;
+            S.playing=false; S.curr=0; updatePH();
+
+            const str = D.cvs.captureStream(30);
+            const rec = new MediaRecorder(str, {mimeType:'video/webm;codecs=vp9', videoBitsPerSecond:6000000});
+            const chk = [];
+            rec.ondataavailable = e => chk.push(e.data);
+            rec.onstop = () => {
+                const url = URL.createObjectURL(new Blob(chk, {type:'video/webm'}));
+                const a = document.createElement('a'); a.href=url; a.download='webcut_export.webm'; a.click();
+                btn.innerText="내보내기"; btn.disabled=false;
+            };
+            rec.start();
+            
+            const intv = setInterval(() => {
+                S.curr += 1/30; updatePH(); draw();
+                if(S.curr>=S.dur) { clearInterval(intv); rec.stop(); S.curr=0; updatePH(); }
+            }, 1000/60); // Fast render
+        };
+
+        // --- 5. UI 유틸 ---
+        function selectClip(id) { S.sel=id; renderTL(); updateProps(); draw(); }
+        
+        function updateProps() {
+            const p = document.getElementById('props');
+            const c = S.clips.find(x=>x.id===S.sel);
+            if (!c) { p.innerText = "선택 없음"; return; }
+            if (c.type === 'text') {
+                p.innerHTML = `
+                    <div class="mb-2"><label>텍스트</label><input id="pt" class="w-full bg-[#333] border border-[#444] text-gray-200 p-1 rounded" value="${c.text}"></div>
+                    <div><label>사이즈</label><input id="ps" type="number" class="w-full bg-[#333] border border-[#444] text-gray-200 p-1 rounded" value="${c.style.s}"></div>
+                `;
+                document.getElementById('pt').oninput = e => { c.text=e.target.value; draw(); renderTL(); };
+                document.getElementById('ps').oninput = e => { c.style.s=parseInt(e.target.value); draw(); };
+            } else {
+                p.innerHTML = `<div>비디오 클립<br>${c.dur.toFixed(2)}초</div>`;
+            }
+        }
+        
+        document.getElementById('zoom').oninput = e => { S.zoom=parseInt(e.target.value); renderTL(); updatePH(); };
+        document.getElementById('splitBtn').onclick = () => {
+            const c = S.clips.find(x=>x.type==='video' && S.curr>x.tStart && S.curr<x.tStart+x.dur);
+            if (!c) return;
+            const off = S.curr - c.tStart;
+            const nc = { ...c, id:'c_'+Date.now(), srcStart: c.srcStart+off, dur: c.dur-off };
+            c.dur = off;
+            S.clips.splice(S.clips.indexOf(c)+1, 0, nc);
+            calcMagnetic();
+        };
+        document.getElementById('delBtn').onclick = () => {
+            if(S.sel) { S.clips=S.clips.filter(x=>x.id!==S.sel); S.sel=null; calcMagnetic(); }
+        };
+
+        function fmt(s) { const m=Math.floor(s/60), sc=Math.floor(s%60); return m+":"+sc.toString().padStart(2,'0'); }
+        
+        // 스페이스바 재생
+        window.addEventListener('keydown', e => {
+            if(e.code==='Space' && e.target.tagName!=='INPUT') { e.preventDefault(); document.getElementById('playBtn').click(); }
+        });
+    </script>
 </body>
 </html>
